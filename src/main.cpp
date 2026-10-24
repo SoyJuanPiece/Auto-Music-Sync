@@ -8,8 +8,9 @@ using namespace geode::prelude;
 class $modify(ResetMusicLayer, PlayLayer) {
 
     struct Fields {
-        float pitch = 1.0f;
-        float supposedSpeed = 1.0f;
+        float currentPitch = 1.0f;   // pitch actual suavizado
+        float targetPitch = 1.0f;    // pitch al que queremos llegar
+        float supposedSpeed = 1.0f;  // velocidad objetivo del nivel
         bool needingOfPitch = false;
         bool portalsLoaded = false;
         // Per-level speed portal positions (X coordinate where portal triggers)
@@ -18,17 +19,20 @@ class $modify(ResetMusicLayer, PlayLayer) {
         std::vector<int> fastSpeed;
         std::vector<int> fasterSpeed;
         std::vector<int> fastestSpeed;
-        // Track current active portal to avoid pitch oscillation
         int activePortalType = 0; // 0=none, 1=slow, 2=normal, 3=fast, 4=faster, 5=fastest
+        // Hysteresis: extra margin when leaving a portal to prevent flickering
+        int leavePortalType = 0;
     };
 
     bool init(GJGameLevel *level, bool useReplay, bool dontCreateObjects) {
         bool result = PlayLayer::init(level, useReplay, dontCreateObjects);
         m_fields->supposedSpeed = 1.0f;
-        m_fields->pitch = 1.0f;
+        m_fields->currentPitch = 1.0f;
+        m_fields->targetPitch = 1.0f;
         m_fields->needingOfPitch = false;
         m_fields->portalsLoaded = false;
         m_fields->activePortalType = 0;
+        m_fields->leavePortalType = 0;
         m_fields->slowSpeed.clear();
         m_fields->normalSpeed.clear();
         m_fields->fastSpeed.clear();
@@ -104,61 +108,109 @@ class $modify(ResetMusicLayer, PlayLayer) {
         FMOD::ChannelGroup* mGroup = nullptr;
         if (fmod->m_system->getMasterChannelGroup(&mGroup) != FMOD_OK || !mGroup) return;
 
-        // On first valid frame, sync supposedSpeed to the player's actual starting speed
-        if (m_fields->supposedSpeed == 1.0f && m_fields->pitch == 1.0f && !m_fields->needingOfPitch) {
+        // Initialize on first valid frame
+        if (!m_fields->needingOfPitch) {
             m_fields->supposedSpeed = m_player1->m_playerSpeed;
             if (m_fields->supposedSpeed == 0.0f) m_fields->supposedSpeed = 1.0f;
-            m_fields->pitch = m_fields->supposedSpeed;
-            mGroup->setPitch(m_fields->pitch);
+            m_fields->currentPitch = m_fields->supposedSpeed;
+            m_fields->targetPitch = m_fields->supposedSpeed;
+            mGroup->setPitch(m_fields->currentPitch);
             m_fields->needingOfPitch = true;
         }
 
         float currentSpeed = m_player1->m_playerSpeed;
         float playerX = floor(m_player1->getPositionX());
 
-        // Detect which speed portal we are currently at (strict 1-pixel threshold)
+        // Detect which speed portal we are currently at
         int newPortalType = 0;
-        float targetSpeed = currentSpeed;
+        float targetSpeed = 1.0f;
 
         for (int pos : m_fields->slowSpeed) {
-            if (std::abs(playerX - pos) <= 1.0f) { newPortalType = 1; targetSpeed = 0.7f; break; }
+            if (std::abs(playerX - pos) <= 3.0f) { newPortalType = 1; targetSpeed = 0.7f; break; }
         }
         if (newPortalType == 0) {
             for (int pos : m_fields->normalSpeed) {
-                if (std::abs(playerX - pos) <= 1.0f) { newPortalType = 2; targetSpeed = 0.9f; break; }
+                if (std::abs(playerX - pos) <= 3.0f) { newPortalType = 2; targetSpeed = 0.9f; break; }
             }
         }
         if (newPortalType == 0) {
             for (int pos : m_fields->fastSpeed) {
-                if (std::abs(playerX - pos) <= 1.0f) { newPortalType = 3; targetSpeed = 1.1f; break; }
+                if (std::abs(playerX - pos) <= 3.0f) { newPortalType = 3; targetSpeed = 1.1f; break; }
             }
         }
         if (newPortalType == 0) {
             for (int pos : m_fields->fasterSpeed) {
-                if (std::abs(playerX - pos) <= 1.0f) { newPortalType = 4; targetSpeed = 1.3f; break; }
+                if (std::abs(playerX - pos) <= 3.0f) { newPortalType = 4; targetSpeed = 1.3f; break; }
             }
         }
         if (newPortalType == 0) {
             for (int pos : m_fields->fastestSpeed) {
-                if (std::abs(playerX - pos) <= 1.0f) { newPortalType = 5; targetSpeed = 1.6f; break; }
+                if (std::abs(playerX - pos) <= 3.0f) { newPortalType = 5; targetSpeed = 1.6f; break; }
             }
         }
 
-        // Only update pitch when we enter a NEW portal (avoid oscillation / audio jumps)
+        // Enter a portal: set target pitch immediately (will be smoothed by lerp below)
         if (newPortalType != 0 && newPortalType != m_fields->activePortalType) {
             m_fields->activePortalType = newPortalType;
+            m_fields->leavePortalType = 0;
             m_fields->supposedSpeed = targetSpeed;
-            m_fields->pitch = targetSpeed;
-            if (m_fields->pitch < 0.1f) m_fields->pitch = 0.1f;
-            if (m_fields->pitch > 10.0f) m_fields->pitch = 10.0f;
-            mGroup->setPitch(m_fields->pitch);
+            m_fields->targetPitch = targetSpeed;
         }
-        // When we leave a portal and return to normal speed, restore pitch to 1.0
+        // Leave a portal: use hysteresis margin before returning to normal
         else if (newPortalType == 0 && m_fields->activePortalType != 0) {
-            m_fields->activePortalType = 0;
-            m_fields->supposedSpeed = 1.0f;
-            m_fields->pitch = 1.0f;
-            mGroup->setPitch(1.0f);
+            if (m_fields->leavePortalType == 0) {
+                m_fields->leavePortalType = m_fields->activePortalType;
+            }
+            // Only return to normal once we've moved far enough away (hysteresis)
+            bool farEnough = true;
+            // Check distance from the portal we just left
+            if (m_fields->leavePortalType == 1) {
+                for (int pos : m_fields->slowSpeed) {
+                    if (std::abs(playerX - pos) <= 10.0f) { farEnough = false; break; }
+                }
+            } else if (m_fields->leavePortalType == 2) {
+                for (int pos : m_fields->normalSpeed) {
+                    if (std::abs(playerX - pos) <= 10.0f) { farEnough = false; break; }
+                }
+            } else if (m_fields->leavePortalType == 3) {
+                for (int pos : m_fields->fastSpeed) {
+                    if (std::abs(playerX - pos) <= 10.0f) { farEnough = false; break; }
+                }
+            } else if (m_fields->leavePortalType == 4) {
+                for (int pos : m_fields->fasterSpeed) {
+                    if (std::abs(playerX - pos) <= 10.0f) { farEnough = false; break; }
+                }
+            } else if (m_fields->leavePortalType == 5) {
+                for (int pos : m_fields->fastestSpeed) {
+                    if (std::abs(playerX - pos) <= 10.0f) { farEnough = false; break; }
+                }
+            }
+
+            if (farEnough) {
+                m_fields->activePortalType = 0;
+                m_fields->leavePortalType = 0;
+                m_fields->supposedSpeed = 1.0f;
+                m_fields->targetPitch = 1.0f;
+            }
+        }
+
+        // Smoothly interpolate current pitch toward target pitch (prevents audio jumps/pucher)
+        float pitchDiff = m_fields->targetPitch - m_fields->currentPitch;
+        if (std::abs(pitchDiff) > 0.001f) {
+            // Lerp factor: how fast to approach target (per second)
+            float lerpSpeed = 8.0f;
+            m_fields->currentPitch += pitchDiff * lerpSpeed * p0;
+            // Clamp to avoid overshooting
+            if (pitchDiff > 0.0f && m_fields->currentPitch > m_fields->targetPitch) {
+                m_fields->currentPitch = m_fields->targetPitch;
+            }
+            if (pitchDiff < 0.0f && m_fields->currentPitch < m_fields->targetPitch) {
+                m_fields->currentPitch = m_fields->targetPitch;
+            }
+            // Safety clamp
+            if (m_fields->currentPitch < 0.1f) m_fields->currentPitch = 0.1f;
+            if (m_fields->currentPitch > 10.0f) m_fields->currentPitch = 10.0f;
+            mGroup->setPitch(m_fields->currentPitch);
         }
     }
 
@@ -186,8 +238,10 @@ class $modify(ResetMusicLayer, PlayLayer) {
     void resetMusic() {
         m_fields->needingOfPitch = false;
         m_fields->supposedSpeed = 1.0f;
-        m_fields->pitch = 1.0f;
+        m_fields->currentPitch = 1.0f;
+        m_fields->targetPitch = 1.0f;
         m_fields->activePortalType = 0;
+        m_fields->leavePortalType = 0;
         auto fmod = FMODAudioEngine::sharedEngine();
         if (!fmod) return;
         FMOD::ChannelGroup* mGroup = nullptr;
@@ -198,8 +252,10 @@ class $modify(ResetMusicLayer, PlayLayer) {
 
     void quickRestart() {
         m_fields->supposedSpeed = 1.0f;
-        m_fields->pitch = 1.0f;
+        m_fields->currentPitch = 1.0f;
+        m_fields->targetPitch = 1.0f;
         m_fields->activePortalType = 0;
+        m_fields->leavePortalType = 0;
         m_fields->needingOfPitch = false;
         auto fmod = FMODAudioEngine::sharedEngine();
         if (!fmod) return;
