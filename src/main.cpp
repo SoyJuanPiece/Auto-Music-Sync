@@ -3,7 +3,7 @@
 
 using namespace geode::prelude;
 
-// OBJECT IDS | slow = 200 0.7 | normal speed = 201, 0.9 | 2x = 202 1.1 | 3x = 203 1.3 | 4x = 1334 1.6
+// OBJECT IDS | slow = 200 (0.7x) | normal = 201 (0.9x) | 2x = 202 (1.1x) | 3x = 203 (1.3x) | 4x = 1334 (1.6x)
 
 class $modify(ResetMusicLayer, PlayLayer) {
 
@@ -11,13 +11,15 @@ class $modify(ResetMusicLayer, PlayLayer) {
         float pitch = 1.0f;
         float supposedSpeed = 1.0f;
         bool needingOfPitch = false;
+        bool portalsLoaded = false;
         // Per-level speed portal positions (X coordinate where portal triggers)
         std::vector<int> slowSpeed;
         std::vector<int> normalSpeed;
         std::vector<int> fastSpeed;
         std::vector<int> fasterSpeed;
         std::vector<int> fastestSpeed;
-        bool portalsLoaded = false;
+        // Track current active portal to avoid pitch oscillation
+        int activePortalType = 0; // 0=none, 1=slow, 2=normal, 3=fast, 4=faster, 5=fastest
     };
 
     bool init(GJGameLevel *level, bool useReplay, bool dontCreateObjects) {
@@ -26,6 +28,7 @@ class $modify(ResetMusicLayer, PlayLayer) {
         m_fields->pitch = 1.0f;
         m_fields->needingOfPitch = false;
         m_fields->portalsLoaded = false;
+        m_fields->activePortalType = 0;
         m_fields->slowSpeed.clear();
         m_fields->normalSpeed.clear();
         m_fields->fastSpeed.clear();
@@ -38,7 +41,6 @@ class $modify(ResetMusicLayer, PlayLayer) {
             mGroup->setPitch(1.0f);
         }
 
-        // Reset pitch state so we start fresh
         quickRestart();
 
         gd::string levelString = m_level->m_levelString;
@@ -102,87 +104,61 @@ class $modify(ResetMusicLayer, PlayLayer) {
         FMOD::ChannelGroup* mGroup = nullptr;
         if (fmod->m_system->getMasterChannelGroup(&mGroup) != FMOD_OK || !mGroup) return;
 
-        // Initialize supposedSpeed on first valid frame
-        if (m_fields->supposedSpeed == 0.0f) {
+        // On first valid frame, sync supposedSpeed to the player's actual starting speed
+        if (m_fields->supposedSpeed == 1.0f && m_fields->pitch == 1.0f && !m_fields->needingOfPitch) {
             m_fields->supposedSpeed = m_player1->m_playerSpeed;
             if (m_fields->supposedSpeed == 0.0f) m_fields->supposedSpeed = 1.0f;
+            m_fields->pitch = m_fields->supposedSpeed;
+            mGroup->setPitch(m_fields->pitch);
+            m_fields->needingOfPitch = true;
         }
 
         float currentSpeed = m_player1->m_playerSpeed;
         float playerX = floor(m_player1->getPositionX());
-        float newSupposedSpeed = m_fields->supposedSpeed;
-        bool foundPortal = false;
 
-        // Check slow portals (0.7x)
+        // Detect which speed portal we are currently at (strict 1-pixel threshold)
+        int newPortalType = 0;
+        float targetSpeed = currentSpeed;
+
         for (int pos : m_fields->slowSpeed) {
-            if (std::abs(playerX - pos) <= 2.0f) {
-                newSupposedSpeed = 0.7f;
-                foundPortal = true;
-                break;
-            }
+            if (std::abs(playerX - pos) <= 1.0f) { newPortalType = 1; targetSpeed = 0.7f; break; }
         }
-        // Check normal portals (0.9x)
-        if (!foundPortal) {
+        if (newPortalType == 0) {
             for (int pos : m_fields->normalSpeed) {
-                if (std::abs(playerX - pos) <= 2.0f) {
-                    newSupposedSpeed = 0.9f;
-                    foundPortal = true;
-                    break;
-                }
+                if (std::abs(playerX - pos) <= 1.0f) { newPortalType = 2; targetSpeed = 0.9f; break; }
             }
         }
-        // Check fast portals (1.1x)
-        if (!foundPortal) {
+        if (newPortalType == 0) {
             for (int pos : m_fields->fastSpeed) {
-                if (std::abs(playerX - pos) <= 2.0f) {
-                    newSupposedSpeed = 1.1f;
-                    foundPortal = true;
-                    break;
-                }
+                if (std::abs(playerX - pos) <= 1.0f) { newPortalType = 3; targetSpeed = 1.1f; break; }
             }
         }
-        // Check faster portals (1.3x)
-        if (!foundPortal) {
+        if (newPortalType == 0) {
             for (int pos : m_fields->fasterSpeed) {
-                if (std::abs(playerX - pos) <= 2.0f) {
-                    newSupposedSpeed = 1.3f;
-                    foundPortal = true;
-                    break;
-                }
+                if (std::abs(playerX - pos) <= 1.0f) { newPortalType = 4; targetSpeed = 1.3f; break; }
             }
         }
-        // Check fastest portals (1.6x)
-        if (!foundPortal) {
+        if (newPortalType == 0) {
             for (int pos : m_fields->fastestSpeed) {
-                if (std::abs(playerX - pos) <= 2.0f) {
-                    newSupposedSpeed = 1.6f;
-                    foundPortal = true;
-                    break;
-                }
+                if (std::abs(playerX - pos) <= 1.0f) { newPortalType = 5; targetSpeed = 1.6f; break; }
             }
         }
 
-        // If we detected a new speed target, update it
-        if (foundPortal && newSupposedSpeed != m_fields->supposedSpeed) {
-            m_fields->supposedSpeed = newSupposedSpeed;
+        // Only update pitch when we enter a NEW portal (avoid oscillation / audio jumps)
+        if (newPortalType != 0 && newPortalType != m_fields->activePortalType) {
+            m_fields->activePortalType = newPortalType;
+            m_fields->supposedSpeed = targetSpeed;
+            m_fields->pitch = targetSpeed;
+            if (m_fields->pitch < 0.1f) m_fields->pitch = 0.1f;
+            if (m_fields->pitch > 10.0f) m_fields->pitch = 10.0f;
+            mGroup->setPitch(m_fields->pitch);
         }
-
-        if (m_fields->needingOfPitch) {
-            if (!m_player1->m_isPlatformer) {
-                if (currentSpeed != m_fields->supposedSpeed && m_fields->supposedSpeed != 0.0f) {
-                    // Adjust pitch to compensate for speed difference
-                    // pitch = currentSpeed / supposedSpeed keeps music aligned with gameplay
-                    m_fields->pitch = currentSpeed / m_fields->supposedSpeed;
-                    // Clamp pitch to sane range to avoid extreme audio distortion
-                    if (m_fields->pitch < 0.1f) m_fields->pitch = 0.1f;
-                    if (m_fields->pitch > 10.0f) m_fields->pitch = 10.0f;
-                    mGroup->setPitch(m_fields->pitch);
-                }
-                else if (currentSpeed == m_fields->supposedSpeed) {
-                    mGroup->setPitch(1.0f);
-                    m_fields->pitch = 1.0f;
-                }
-            }
+        // When we leave a portal and return to normal speed, restore pitch to 1.0
+        else if (newPortalType == 0 && m_fields->activePortalType != 0) {
+            m_fields->activePortalType = 0;
+            m_fields->supposedSpeed = 1.0f;
+            m_fields->pitch = 1.0f;
+            mGroup->setPitch(1.0f);
         }
     }
 
@@ -211,6 +187,7 @@ class $modify(ResetMusicLayer, PlayLayer) {
         m_fields->needingOfPitch = false;
         m_fields->supposedSpeed = 1.0f;
         m_fields->pitch = 1.0f;
+        m_fields->activePortalType = 0;
         auto fmod = FMODAudioEngine::sharedEngine();
         if (!fmod) return;
         FMOD::ChannelGroup* mGroup = nullptr;
@@ -222,6 +199,7 @@ class $modify(ResetMusicLayer, PlayLayer) {
     void quickRestart() {
         m_fields->supposedSpeed = 1.0f;
         m_fields->pitch = 1.0f;
+        m_fields->activePortalType = 0;
         m_fields->needingOfPitch = false;
         auto fmod = FMODAudioEngine::sharedEngine();
         if (!fmod) return;
